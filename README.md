@@ -8,8 +8,9 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
-	"pool"
+    "math/rand"
+    
+	"github.com/wuyongjia/pool"
 )
 
 func main() {
