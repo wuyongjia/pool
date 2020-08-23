@@ -8,7 +8,7 @@ package main
 
 import (
     "fmt"
-    "math/rand"
+    "math/rand" 
 	"github.com/wuyongjia/pool"
 )
 
