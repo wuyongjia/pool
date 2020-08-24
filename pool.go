@@ -11,7 +11,7 @@ import (
 const (
 	DEFAULT_LENGTH          = 20480 // max size of the pool
 	DEFAULT_TIMEOUT         = 120   // every 120 seconds to recycle the status
-	DEFAULT_COUNTER_EXPIRET = 10    // expired data will be deleted
+	DEFAULT_COUNTER_EXPIRET = 20    // it depends on the counter, expired data will be deleted
 	CHAN_GET_G              = 'g'
 )
 
@@ -87,8 +87,6 @@ func (p *Pool) GetInstanceCount() int {
 }
 
 func (p *Pool) getItem() (interface{}, error) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
 	if p.cursor < 0 {
 		return nil, errors.New("the pool is full")
 	}
@@ -96,6 +94,9 @@ func (p *Pool) getItem() (interface{}, error) {
 	var err error
 	var item *Item
 	var ok bool
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
 
 	var id = p.availablelist[p.cursor]
 	if id > 0 {
@@ -134,8 +135,6 @@ func (p *Pool) createItem() (uint64, *Item, error) {
 }
 
 func (p *Pool) putItem(ptr interface{}) error {
-	p.lock.Lock()
-	defer p.lock.Unlock()
 	if (p.cursor + 1) >= p.length {
 		return errors.New("the cursor is now at the last boundary")
 	}
@@ -144,6 +143,10 @@ func (p *Pool) putItem(ptr interface{}) error {
 		return errors.New("the item must be a pointer")
 	}
 	var id = *(*uint64)(unsafe.Pointer(rv.Pointer()))
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
 	var ok bool
 	var item *Item
 	if item, ok = p.listprt[id]; ok == false {
@@ -158,10 +161,7 @@ func (p *Pool) putItem(ptr interface{}) error {
 	return nil
 }
 
-func (p *Pool) recycle() {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
+func (p *Pool) Recycle() {
 	var key uint64
 	var item *Item
 
@@ -171,13 +171,16 @@ func (p *Pool) recycle() {
 	var inusecount = 0
 	var deleted = false
 
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
 	for key, item = range p.listprt {
 		if item.at > 0 {
 			if timestamp-item.at > DEFAULT_TIMEOUT {
-				p.cursor++
-				p.availablelist[p.cursor] = key
 				item.counter = 0
 				item.at = 0
+				p.cursor++
+				p.availablelist[p.cursor] = key
 
 				tempList[index] = key
 				index++
@@ -223,7 +226,7 @@ func (p *Pool) loop() {
 		case ptr = <-p.putop:
 			p.putrt <- p.putItem(ptr)
 		case <-timer.C:
-			p.recycle()
+			p.Recycle()
 		}
 	}
 }
