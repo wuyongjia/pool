@@ -26,8 +26,10 @@ type Pool struct {
 	cursor        int
 	length        int
 	availablelist []uint64
+	tempList      []uint64
 	listprt       map[uint64]*Item
 	timeout       time.Duration
+	allocFunc     AllocFunc // must return pointer
 	lock          *sync.RWMutex
 }
 
@@ -37,15 +39,10 @@ type Item struct {
 	at      int64       // activity timestamp
 }
 
-var allocFunc AllocFunc // must return pointer
-
-var tempList []uint64
-
-func New(length int, af AllocFunc) *Pool {
+func New(length int, allocFunc AllocFunc) *Pool {
 	if length <= 0 {
 		length = DEFAULT_LENGTH
 	}
-	allocFunc = af
 	var pool = &Pool{
 		getop:         make(chan byte, length),
 		getrt:         make(chan interface{}, 1),
@@ -55,11 +52,12 @@ func New(length int, af AllocFunc) *Pool {
 		cursor:        length - 1,
 		length:        length,
 		availablelist: make([]uint64, length),
+		tempList:      make([]uint64, length),
 		listprt:       make(map[uint64]*Item),
 		timeout:       DEFAULT_TIMEOUT * time.Second,
+		allocFunc:     allocFunc,
 		lock:          &sync.RWMutex{},
 	}
-	tempList = make([]uint64, length)
 	go pool.loop()
 	return pool
 }
@@ -126,7 +124,7 @@ func (p *Pool) getItem() (interface{}, error) {
 }
 
 func (p *Pool) createItem() (uint64, *Item, error) {
-	var ptr = allocFunc()
+	var ptr = p.allocFunc()
 	var rv = reflect.ValueOf(ptr)
 	if rv.Kind() != reflect.Ptr {
 		return 0, nil, errors.New("the new item must be a pointer")
@@ -182,7 +180,7 @@ func (p *Pool) Recycle() {
 				p.cursor++
 				p.availablelist[p.cursor] = key
 
-				tempList[index] = key
+				p.tempList[index] = key
 				index++
 			} else {
 				inusecount++
@@ -193,7 +191,7 @@ func (p *Pool) Recycle() {
 				deleted = true
 			} else {
 				item.counter++
-				tempList[index] = key
+				p.tempList[index] = key
 				index++
 			}
 		}
@@ -202,7 +200,7 @@ func (p *Pool) Recycle() {
 		var i, j int
 		j = 0
 		for i = p.length - index - inusecount; i < p.length-inusecount; i++ {
-			p.availablelist[i] = tempList[j]
+			p.availablelist[i] = p.tempList[j]
 			j++
 		}
 		p.cursor = p.length - inusecount - 1
