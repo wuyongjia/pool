@@ -163,14 +163,14 @@ func (p *Pool) Recycle() {
 	var key uint64
 	var item *Item
 
-	var timestamp = time.Now().Unix()
-
 	var index = 0
 	var inusecount = 0
 	var deleted = false
 
 	p.lock.Lock()
 	defer p.lock.Unlock()
+
+	var timestamp = time.Now().Unix()
 
 	for key, item = range p.listprt {
 		if item.at > 0 {
