@@ -43,7 +43,8 @@ type Pool struct {
 	availablelist     []uint64
 	tempList          []uint64
 	listprt           *hashmap.HM
-	timeout           time.Duration
+	recycleInterval   time.Duration
+	timeout           int64
 	isUseId           bool
 	allocFunc         AllocFunc // must return pointer
 	allocWithIdFunc   AllocWithIdFunc
@@ -98,7 +99,8 @@ func newPool(length int) *Pool {
 		availablelist:     make([]uint64, length),
 		tempList:          make([]uint64, length),
 		listprt:           hashmap.New(length),
-		timeout:           DEFAULT_TIMEOUT * time.Second,
+		recycleInterval:   DEFAULT_TIMEOUT * time.Second,
+		timeout:           DEFAULT_TIMEOUT,
 		RecycleUpdateFunc: nil,
 		lock:              &sync.RWMutex{},
 	}
@@ -107,6 +109,14 @@ func newPool(length int) *Pool {
 
 func (p *Pool) SetMode(mode Mode) {
 	p.mode = mode
+}
+
+func (p *Pool) SetRecycleInterval(t time.Duration) {
+	p.recycleInterval = t
+}
+
+func (p *Pool) SetTimeout(t int64) {
+	p.timeout = t
 }
 
 func (p *Pool) Get() (interface{}, error) {
@@ -276,7 +286,7 @@ func (p *Pool) Recycle() {
 		key = k.(uint64)
 		item = v.(*Item)
 		if item.at > 0 {
-			if timestamp-item.at > DEFAULT_TIMEOUT {
+			if timestamp-item.at > p.timeout {
 				item.counter = 0
 				item.at = 0
 				p.cursor++
@@ -333,7 +343,7 @@ func (p *Pool) loop() {
 
 func (p *Pool) recycleLoop() {
 	go func() {
-		var timer = time.NewTicker(DEFAULT_TIMEOUT * time.Second)
+		var timer = time.NewTicker(p.recycleInterval)
 		defer timer.Stop()
 		for {
 			<-timer.C
