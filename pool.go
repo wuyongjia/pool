@@ -12,9 +12,11 @@ import (
 
 const (
 	DEFAULT_LENGTH          = 20480 // max size of the pool
-	DEFAULT_TIMEOUT         = 3600  // every 3600 seconds to recycle the status
+	DEFAULT_TIMEOUT         = 1800  // every 1800 seconds to recycle the status
 	DEFAULT_COUNTER_EXPIRET = 1     // it depends on the counter, expired data will be deleted
-	CHAN_GET_G              = 'g'
+	CHAN_GET                = 'g'
+	CHAN_LOOP_CANCLE        = 'c'
+	CHAN_RECYCLE_CANCLE     = 'c'
 )
 
 type Mode int
@@ -38,6 +40,8 @@ type Pool struct {
 	putop             chan interface{}
 	putid             chan uint64
 	putrt             chan error
+	loopCancel        chan byte
+	recycleCancel     chan byte
 	cursor            int
 	length            int
 	availablelist     []uint64
@@ -66,8 +70,6 @@ func New(length int, allocFunc AllocFunc) *Pool {
 	pool.isUseId = false
 	pool.allocFunc = allocFunc
 	pool.allocWithIdFunc = nil
-	pool.loop()
-	pool.recycleLoop()
 	return pool
 }
 
@@ -79,8 +81,6 @@ func NewWithId(length int, allocWithIdFunc AllocWithIdFunc) *Pool {
 	pool.isUseId = true
 	pool.allocWithIdFunc = allocWithIdFunc
 	pool.allocFunc = nil
-	pool.loop()
-	pool.recycleLoop()
 	return pool
 }
 
@@ -94,6 +94,8 @@ func newPool(length int) *Pool {
 		putop:             make(chan interface{}, length),
 		putid:             make(chan uint64, length),
 		putrt:             make(chan error, 1),
+		loopCancel:        make(chan byte, 1),
+		recycleCancel:     make(chan byte, 1),
 		cursor:            length - 1,
 		length:            length,
 		availablelist:     make([]uint64, length),
@@ -107,8 +109,22 @@ func newPool(length int) *Pool {
 	return pool
 }
 
-func (p *Pool) SetMode(mode Mode) {
-	p.mode = mode
+func (p *Pool) EnableQueue() {
+	p.mode = MODE_QUEUE
+	p.loop()
+}
+
+func (p *Pool) DisableQueue() {
+	p.mode = MODE_NONE
+	p.loopCancel <- CHAN_LOOP_CANCLE
+}
+
+func (p *Pool) EnableRecycle() {
+	p.recycleLoop()
+}
+
+func (p *Pool) DisableRecycle() {
+	p.recycleCancel <- CHAN_RECYCLE_CANCLE
 }
 
 func (p *Pool) SetRecycleInterval(t time.Duration) {
@@ -123,7 +139,7 @@ func (p *Pool) Get() (interface{}, error) {
 	if p.mode == MODE_NONE {
 		return p.getItem()
 	} else {
-		p.getop <- CHAN_GET_G
+		p.getop <- CHAN_GET
 		return <-p.getrt, <-p.geter
 	}
 }
@@ -167,6 +183,8 @@ func (p *Pool) GetInstanceCount() int {
 func (p *Pool) getItem() (interface{}, error) {
 	var err error
 	var value interface{}
+
+	var ok bool
 	var item *Item
 
 	p.lock.Lock()
@@ -179,8 +197,8 @@ func (p *Pool) getItem() (interface{}, error) {
 	var id = p.availablelist[p.cursor]
 	if id > 0 {
 		value = p.listprt.Get(id)
-		item = value.(*Item)
-		if item != nil {
+		item, ok = value.(*Item)
+		if ok == true && item != nil {
 			item.counter = 0
 			item.at = time.Now().Unix()
 		} else {
@@ -249,12 +267,14 @@ func (p *Pool) putItem(ptr interface{}, id uint64) error {
 	}
 
 	var value interface{}
+
+	var ok bool
 	var item *Item
 
 	value = p.listprt.Get(id)
-	item = value.(*Item)
+	item, ok = value.(*Item)
 
-	if item == nil {
+	if ok == false || item == nil {
 		return errors.New("the item does not exist in the pool")
 	}
 
@@ -271,6 +291,8 @@ func (p *Pool) putItem(ptr interface{}, id uint64) error {
 
 func (p *Pool) Recycle() {
 	var key uint64
+
+	var ok bool
 	var item *Item
 
 	var index = 0
@@ -282,9 +304,15 @@ func (p *Pool) Recycle() {
 
 	var timestamp = time.Now().Unix()
 
-	p.listprt.Iterate(func(k interface{}, v interface{}) {
-		key = k.(uint64)
-		item = v.(*Item)
+	p.listprt.IterateAndUpdate(func(k interface{}, v interface{}) bool {
+		key, ok = k.(uint64)
+		if ok == false {
+			return false
+		}
+		item, ok = v.(*Item)
+		if ok == false {
+			return false
+		}
 		if item.at > 0 {
 			if timestamp-item.at > p.timeout {
 				item.counter = 0
@@ -294,20 +322,23 @@ func (p *Pool) Recycle() {
 
 				p.tempList[index] = key
 				index++
+				return true
 			} else {
 				inusecount++
+				return true
 			}
 		} else {
-			if item.counter > DEFAULT_COUNTER_EXPIRET {
+			if item.counter >= DEFAULT_COUNTER_EXPIRET {
 				if p.RecycleUpdateFunc != nil {
 					p.RecycleUpdateFunc(item.ptr)
 				}
-				p.listprt.Remove(key)
 				deleted = true
+				return false
 			} else {
 				item.counter++
 				p.tempList[index] = key
 				index++
+				return true
 			}
 		}
 	})
@@ -336,6 +367,8 @@ func (p *Pool) loop() {
 			case ptr = <-p.putop:
 				id = <-p.putid
 				p.putrt <- p.putItem(ptr, id)
+			case <-p.loopCancel:
+				return
 			}
 		}
 	}()
@@ -346,8 +379,12 @@ func (p *Pool) recycleLoop() {
 		var timer = time.NewTicker(p.recycleInterval)
 		defer timer.Stop()
 		for {
-			<-timer.C
-			p.Recycle()
+			select {
+			case <-timer.C:
+				p.Recycle()
+			case <-p.recycleCancel:
+				return
+			}
 		}
 	}()
 }
