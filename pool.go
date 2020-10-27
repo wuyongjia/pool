@@ -11,12 +11,12 @@ import (
 )
 
 const (
-	DEFAULT_LENGTH          = 20480 // max size of the pool
-	DEFAULT_TIMEOUT         = 1800  // every 1800 seconds to recycle the status
-	DEFAULT_COUNTER_EXPIRET = 1     // it depends on the counter, expired data will be deleted
-	CHAN_GET                = 'g'
-	CHAN_LOOP_CANCLE        = 'c'
-	CHAN_RECYCLE_CANCLE     = 'c'
+	DEFAULT_LENGTH             = 20480 // default max size of the pool
+	DEFAULT_TIMEOUT            = 1800  // default every 1800 seconds to recycle the status
+	DEFAULT_EXPIRATION_COUNTER = 10    // it depends on the counter, expired data will be deleted
+	CHAN_GET                   = 'g'
+	CHAN_LOOP_CANCLE           = 'c'
+	CHAN_RECYCLE_CANCLE        = 'c'
 )
 
 type Mode int
@@ -26,34 +26,47 @@ const (
 	MODE_QUEUE Mode = 2
 )
 
+var (
+	ErrorPoolFull             = errors.New("the pool is full")
+	ErrorNewItemMustPointer   = errors.New("the new item must be a pointer")
+	ErrorMustPointer          = errors.New("the item must be a pointer")
+	ErrorLastBoundary         = errors.New("the cursor is now at the last boundary")
+	ErrorItemNotExist         = errors.New("the item does not exist in the pool")
+	ErrorItemHaveBeenRecycled = errors.New("the item may have been recycled")
+)
+
 type AllocFunc func() interface{}
 type AllocWithIdFunc func(id uint64) interface{}
 
 type UpdateFunc func(ptr interface{})
 
 type Pool struct {
-	id                uint64
-	mode              Mode
-	getop             chan byte
-	getrt             chan interface{}
-	geter             chan error
-	putop             chan interface{}
-	putid             chan uint64
-	putrt             chan error
-	loopCancel        chan byte
-	recycleCancel     chan byte
-	cursor            int
-	length            int
-	availablelist     []uint64
-	tempList          []uint64
-	listprt           *hashmap.HM
-	recycleInterval   time.Duration
-	timeout           int64
-	isUseId           bool
-	allocFunc         AllocFunc // must return pointer
-	allocWithIdFunc   AllocWithIdFunc
-	RecycleUpdateFunc UpdateFunc
-	lock              *sync.RWMutex
+	id                   uint64
+	mode                 Mode
+	getop                chan byte
+	getrt                chan interface{}
+	geter                chan error
+	putop                chan interface{}
+	putid                chan uint64
+	putrt                chan error
+	updateop             chan interface{}
+	updateid             chan uint64
+	updatert             chan error
+	loopCancel           chan byte
+	recycleCancel        chan byte
+	cursor               int
+	length               int
+	availablelist        []uint64
+	tempList             []uint64
+	listprt              *hashmap.HM
+	recycleInterval      time.Duration
+	timeout              int64
+	maxExpirationCounter int
+	isUseId              bool
+	allocFunc            AllocFunc // must return pointer
+	allocWithIdFunc      AllocWithIdFunc
+	RecycleUpdateFunc    UpdateFunc
+	lock                 *sync.RWMutex
 }
 
 type Item struct {
@@ -77,34 +90,40 @@ func NewWithId(length int, allocWithIdFunc AllocWithIdFunc) *Pool {
 	if length <= 0 {
 		length = DEFAULT_LENGTH
 	}
+
 	var pool = newPool(length)
 	pool.isUseId = true
 	pool.allocWithIdFunc = allocWithIdFunc
 	pool.allocFunc = nil
+
 	return pool
 }
 
 func newPool(length int) *Pool {
 	var pool = &Pool{
-		id:                0,
-		mode:              MODE_NONE,
-		getop:             make(chan byte, length),
-		getrt:             make(chan interface{}, 1),
-		geter:             make(chan error, 1),
-		putop:             make(chan interface{}, length),
-		putid:             make(chan uint64, length),
-		putrt:             make(chan error, 1),
-		loopCancel:        make(chan byte, 1),
-		recycleCancel:     make(chan byte, 1),
-		cursor:            length - 1,
-		length:            length,
-		availablelist:     make([]uint64, length),
-		tempList:          make([]uint64, length),
-		listprt:           hashmap.New(length),
-		recycleInterval:   DEFAULT_TIMEOUT * time.Second,
-		timeout:           DEFAULT_TIMEOUT,
-		RecycleUpdateFunc: nil,
-		lock:              &sync.RWMutex{},
+		id:                   0,
+		mode:                 MODE_NONE,
+		getop:                make(chan byte, length),
+		getrt:                make(chan interface{}),
+		geter:                make(chan error),
+		putop:                make(chan interface{}, length),
+		putid:                make(chan uint64, length),
+		putrt:                make(chan error),
+		updateop:             make(chan interface{}, length),
+		updateid:             make(chan uint64, length),
+		updatert:             make(chan error),
+		loopCancel:           make(chan byte),
+		recycleCancel:        make(chan byte),
+		cursor:               length - 1,
+		length:               length,
+		availablelist:        make([]uint64, length),
+		tempList:             make([]uint64, length),
+		listprt:              hashmap.New(length),
+		recycleInterval:      DEFAULT_TIMEOUT * time.Second,
+		timeout:              DEFAULT_TIMEOUT,
+		maxExpirationCounter: DEFAULT_EXPIRATION_COUNTER,
+		RecycleUpdateFunc:    nil,
+		lock:                 &sync.RWMutex{},
 	}
 	return pool
 }
@@ -133,6 +152,10 @@ func (p *Pool) SetRecycleInterval(t time.Duration) {
 
 func (p *Pool) SetTimeout(t int64) {
 	p.timeout = t
+}
+
+func (p *Pool) SetMaxExpirationCounter(n int) {
+	p.maxExpirationCounter = n
 }
 
 func (p *Pool) Get() (interface{}, error) {
@@ -164,6 +187,26 @@ func (p *Pool) PutWithId(ptr interface{}, id uint64) error {
 	}
 }
 
+func (p *Pool) Update(ptr interface{}) error {
+	if p.mode == MODE_NONE {
+		return p.updateItem(ptr, 0)
+	} else {
+		p.updateop <- ptr
+		p.updateid <- 0
+		return <-p.updatert
+	}
+}
+
+func (p *Pool) UpdateWithId(ptr interface{}, id uint64) error {
+	if p.mode == MODE_NONE {
+		return p.updateItem(ptr, id)
+	} else {
+		p.updateop <- ptr
+		p.updateid <- id
+		return <-p.updatert
+	}
+}
+
 func (p *Pool) GetCursor() int {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
@@ -181,18 +224,18 @@ func (p *Pool) GetInstanceCount() int {
 }
 
 func (p *Pool) getItem() (interface{}, error) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if p.cursor < 0 {
+		return nil, ErrorPoolFull
+	}
+
 	var err error
 	var value interface{}
 
 	var ok bool
 	var item *Item
-
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	if p.cursor < 0 {
-		return nil, errors.New("the pool is full")
-	}
 
 	var id = p.availablelist[p.cursor]
 	if id > 0 {
@@ -234,7 +277,7 @@ func (p *Pool) createItem() (uint64, *Item, error) {
 	var ptr = p.allocFunc()
 	var rv = reflect.ValueOf(ptr)
 	if rv.Kind() != reflect.Ptr {
-		return 0, nil, errors.New("the new item must be a pointer")
+		return 0, nil, ErrorNewItemMustPointer
 	}
 	return *(*uint64)(unsafe.Pointer(rv.Pointer())), &Item{ptr: ptr, counter: 0, at: time.Now().Unix()}, nil
 }
@@ -244,7 +287,7 @@ func (p *Pool) createItemWithId() (uint64, *Item, error) {
 	var ptr = p.allocWithIdFunc(p.id)
 	var rv = reflect.ValueOf(ptr)
 	if rv.Kind() != reflect.Ptr {
-		return 0, nil, errors.New("the new item must be a pointer")
+		return 0, nil, ErrorNewItemMustPointer
 	}
 	return p.id, &Item{ptr: ptr, counter: 0, at: time.Now().Unix()}, nil
 }
@@ -252,7 +295,7 @@ func (p *Pool) createItemWithId() (uint64, *Item, error) {
 func (p *Pool) putItem(ptr interface{}, id uint64) error {
 	var rv = reflect.ValueOf(ptr)
 	if rv.Kind() != reflect.Ptr {
-		return errors.New("the item must be a pointer")
+		return ErrorMustPointer
 	}
 
 	if p.isUseId == false {
@@ -263,28 +306,58 @@ func (p *Pool) putItem(ptr interface{}, id uint64) error {
 	defer p.lock.Unlock()
 
 	if (p.cursor + 1) >= p.length {
-		return errors.New("the cursor is now at the last boundary")
+		return ErrorLastBoundary
 	}
 
-	var value interface{}
+	var value = p.listprt.Get(id)
+	if value == nil {
+		return ErrorItemNotExist
+	}
 
-	var ok bool
-	var item *Item
-
-	value = p.listprt.Get(id)
-	item, ok = value.(*Item)
-
+	var item, ok = value.(*Item)
 	if ok == false || item == nil {
-		return errors.New("the item does not exist in the pool")
+		return ErrorItemNotExist
 	}
 
 	if item.at == 0 {
-		return errors.New("the item may have been recycled over time")
+		return ErrorItemHaveBeenRecycled
 	}
 
 	p.cursor++
 	p.availablelist[p.cursor] = id
 	item.at = 0
+
+	return nil
+}
+
+func (p *Pool) updateItem(ptr interface{}, id uint64) error {
+	var rv = reflect.ValueOf(ptr)
+	if rv.Kind() != reflect.Ptr {
+		return ErrorMustPointer
+	}
+
+	if p.isUseId == false {
+		id = *(*uint64)(unsafe.Pointer(rv.Pointer()))
+	}
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	var value = p.listprt.Get(id)
+	if value == nil {
+		return ErrorItemNotExist
+	}
+
+	var item, ok = value.(*Item)
+	if ok == false || item == nil {
+		return ErrorItemNotExist
+	}
+
+	if item.at == 0 {
+		return ErrorItemHaveBeenRecycled
+	}
+
+	item.at = time.Now().Unix()
 
 	return nil
 }
@@ -328,7 +401,7 @@ func (p *Pool) Recycle() {
 				return true
 			}
 		} else {
-			if item.counter >= DEFAULT_COUNTER_EXPIRET {
+			if item.counter >= p.maxExpirationCounter {
 				if p.RecycleUpdateFunc != nil {
 					p.RecycleUpdateFunc(item.ptr)
 				}
@@ -367,6 +440,9 @@ func (p *Pool) loop() {
 			case ptr = <-p.putop:
 				id = <-p.putid
 				p.putrt <- p.putItem(ptr, id)
+			case ptr = <-p.updateop:
+				id = <-p.updateid
+				p.putrt <- p.updateItem(ptr, id)
 			case <-p.loopCancel:
 				return
 			}
